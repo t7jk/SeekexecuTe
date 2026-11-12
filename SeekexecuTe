@@ -11,6 +11,7 @@ Keys: see the key bar at the bottom of the screen.
 
 License: GPL-3.0 (see LICENSE).
 """
+import math
 import os
 import re
 import subprocess
@@ -39,6 +40,7 @@ DEFAULT_CFG = {
     "nas_user": "",                   # puste = gość (bez hasła)
     "smb_version": "3.0",             # "" = automatycznie
     "preset": "1040STFM  TOS 1.04 GB",   # maszyna + TOS dla Hatari
+    "fullscreen": True,               # start na pełnym ekranie
 }
 SMB_VERSIONS = ["", "3.0", "2.1", "2.0", "1.0"]
 TOS_DIR = os.path.expanduser("~/atarist/tos")
@@ -59,6 +61,7 @@ CACHE = LEGACY_CACHE
 HA = os.path.expanduser("~/.local/bin/ha")
 FAV_FILE = os.path.expanduser("~/.config/SeekexecuTe/favorites.txt")
 CATS_FILE = os.path.expanduser("~/.config/SeekexecuTe/categories.json")
+STATE_FILE = os.path.expanduser("~/.config/SeekexecuTe/state.json")
 CATEGORY_NAMES = {
     "PC": "Point And Click Adventures",
     "FD": "Fire And Destroy",
@@ -77,9 +80,11 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".gif")
 FONT = "Atari ST"
 FONT_PX = 16      # the font is an 8x8 pixel grid: 16 px = crisp 2x scale
 
-WHITE = (1, 1, 1)
-GRAY = (0.6, 0.6, 0.6)
-BLACK = (0, 0, 0)
+# TOS 1.0 look: black ink on white GEM windows over the green desktop
+INK = (0, 0, 0)
+PAPER = (0.871, 0.871, 0.871)      # light grey of GEM windows/menus (TOS 1.0 screenshot)
+GRAY = (0.38, 0.38, 0.38)
+DESKTOP = (0, 0.871, 0)            # TOS 1.0 desktop green
 
 
 # ------------------------------------------------------------- konfiguracja
@@ -92,6 +97,28 @@ def load_config():
     except (OSError, ValueError):
         pass
     return cfg
+
+
+def load_state():
+    import json
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            st = json.load(fh)
+        disp = [x for x in st.get("disp", []) if isinstance(x, str)]
+        sel = st.get("sel")
+        return disp, sel if isinstance(sel, str) else None
+    except (OSError, ValueError, AttributeError):
+        return [], None
+
+
+def save_state(disp, sel):
+    import json
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"disp": disp, "sel": sel}, fh, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 def save_config(cfg):
@@ -408,7 +435,7 @@ def load_pixbuf(path):
 
 
 def key_is_group_end(key):
-    return key in ("_choose", "_mount")
+    return key in ("_choose", "_rescan")
 
 
 # ---------------------------------------------------------------- aplikacja
@@ -451,7 +478,7 @@ class Browser:
         self.win = Gtk.ApplicationWindow(application=app, title="Atari ST")
         self.win.set_default_size(1280, 720)
         css = Gtk.CssProvider()
-        css.load_from_string("window, drawingarea { background: #000; }")
+        css.load_from_string("window, drawingarea { background: #00DE00; }")
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.area = Gtk.DrawingArea()
@@ -466,7 +493,10 @@ class Browser:
         wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
         wheel.connect("scroll", self.on_wheel)
         self.win.add_controller(wheel)
-        self.win.maximize()
+        if CFG.get("fullscreen", True):
+            self.win.fullscreen()
+        else:
+            self.win.maximize()
         self.win.present()
         if getattr(self, "open_settings_on_start", False):
             self.open_settings()
@@ -477,7 +507,34 @@ class Browser:
         if goto:
             self.goto(goto)
         else:
+            self.restore_position()
             self.schedule_info()
+        self.win.connect("close-request", self.on_close)
+
+    def on_close(self, win):
+        self.save_position()
+        return False
+
+    def save_position(self):
+        if self.cfg_mode or self.fav_mode:
+            return
+        sel = self.selection()
+        save_state(list(self.disp), sel[1] if sel else None)
+
+    def restore_position(self):
+        disp, sel = load_state()
+        for label in disp:
+            for idx, (kind, lab, sub, virt) in enumerate(listing(self.node)):
+                if kind == "dir" and lab == label:
+                    self.enter(idx)
+                    break
+            else:
+                break
+        if sel is not None:
+            for idx, item in enumerate(listing(self.node)):
+                if item[1] == sel:
+                    self.cur = idx
+                    break
 
     def goto(self, rel):
         parts = rel.split("/")
@@ -601,13 +658,13 @@ class Browser:
             self.cur = min(self.cur + max(self.rows - 1, 1), n - 1)
         elif keyval == K.KEY_bracketleft:
             self.cur = max(self.cur - max(self.rows - 1, 1), 0)
-        elif keyval == K.KEY_less:
+        elif keyval == K.KEY_comma:
             self.cur = 0
-        elif keyval == K.KEY_greater:
+        elif keyval == K.KEY_period:
             self.cur = max(n - 1, 0)
-        elif keyval in (K.KEY_Right, K.KEY_Return, K.KEY_KP_Enter):
+        elif keyval in (K.KEY_Return, K.KEY_KP_Enter):
             self.activate_item()
-        elif keyval in (K.KEY_Left, K.KEY_Escape, K.KEY_BackSpace):
+        elif keyval in (K.KEY_Left, K.KEY_BackSpace):
             if self.fav_mode:
                 self.toggle_fav_view()
             elif self.stack:
@@ -622,18 +679,9 @@ class Browser:
             self.desc_scroll = max(0, self.desc_scroll - 3 * self.line_h)
         elif keyval in (K.KEY_equal, K.KEY_plus):
             self.desc_scroll += 3 * self.line_h
-        elif keyval == K.KEY_f:
-            if self.win.is_fullscreen():
-                self.win.unfullscreen()
-            else:
-                self.win.fullscreen()
-        elif keyval in (K.KEY_R, K.KEY_r):
-            self.start_rescan()
-        elif keyval in (K.KEY_t, K.KEY_T):
-            self.cycle_preset((-1 if state & Gdk.ModifierType.SHIFT_MASK else 1))
         elif keyval in (K.KEY_c, K.KEY_C):
             self.open_settings()
-        elif keyval in (K.KEY_q, K.KEY_Q):
+        elif keyval == K.KEY_Escape:
             self.win.close()
         else:
             return False
@@ -738,6 +786,7 @@ class Browser:
     CFG_ROWS = [
         ("archive_root", "Archive folder", "text"),
         ("_choose", "Choose archive folder...", "action"),
+        ("fullscreen", "Full screen", "bool"),
         ("mount_nas", "Mount network drive (NAS)", "bool"),
         ("nas_share", "Network share (//host/share/subfolder)", "text"),
         ("nas_user", "User (empty = guest)", "text"),
@@ -745,6 +794,7 @@ class Browser:
         ("preset", "Hatari machine + TOS", "preset"),
         ("smb_version", "SMB version (empty = auto)", "cycle"),
         ("_mount", "Mount now (test)", "action"),
+        ("_rescan", "Rescan archive", "action"),
         ("_save", "Save and apply", "action"),
         ("_cancel", "Cancel", "action"),
     ]
@@ -804,7 +854,7 @@ class Browser:
             self.cfg_cur = max(self.cfg_cur - 1, 0)
         elif keyval in (K.KEY_Escape, K.KEY_Left):
             self.close_settings()
-        elif keyval in (K.KEY_Return, K.KEY_KP_Enter, K.KEY_Right):
+        elif keyval in (K.KEY_Return, K.KEY_KP_Enter):
             self.settings_activate()
         else:
             return False
@@ -830,6 +880,9 @@ class Browser:
             self.choose_folder()
         elif key == "_mount":
             self.settings_mount()
+        elif key == "_rescan":
+            self.close_settings()
+            self.start_rescan()
         elif key == "_save":
             self.settings_save()
         elif key == "_cancel":
@@ -898,6 +951,10 @@ class Browser:
     def settings_saved(self, ok, msg):
         self.scanning = False
         self.close_settings()
+        if CFG.get("fullscreen", True):
+            self.win.fullscreen()
+        else:
+            self.win.unfullscreen()
         self.nas_ok = root_ready()
         self.cache.clear()
         if not self.nas_ok:
@@ -921,17 +978,16 @@ class Browser:
 
     def draw_settings(self, cr, width, height, lh):
         pad = 14
-        self.text(cr, pad, pad, "SETTINGS", WHITE)
-        cr.set_source_rgb(0.4, 0.4, 0.4)
-        cr.rectangle(pad, pad + lh + 2, width - 2 * pad, 1)
-        cr.fill()
+        self.menubar(cr, width, lh)
+        self.window(cr, 6, lh + 14, width - 12, height - lh - 80, "SETTINGS", "")
+        pad = 22
         label_w = int(width * 0.46)
-        y = pad + lh + 12
+        y = lh + 14 + 2 * lh + 10
         for i, (key, label, kind) in enumerate(self.CFG_ROWS):
             if kind == "action":
                 value = ""
             elif kind == "bool":
-                value = "YES" if self.cfg_work[key] else "NO"
+                value = "[x]" if self.cfg_work[key] else "[ ]"
             elif kind == "cycle":
                 value = self.cfg_work[key] or "auto"
             elif kind == "preset":
@@ -944,10 +1000,10 @@ class Browser:
                 value = (("*" * len(self.cfg_buf)) if kind == "pass" else self.cfg_buf) + "_"
             sel = (i == self.cfg_cur)
             if sel:
-                cr.set_source_rgb(*WHITE)
+                cr.set_source_rgb(*INK)
                 cr.rectangle(pad - 4, y, width - 2 * pad + 8, lh)
                 cr.fill()
-            col = BLACK if sel else WHITE
+            col = PAPER if sel else INK
             gap = 12 if kind != "action" else 0
             if kind == "action":
                 self.text(cr, pad, y, "[ %s ]" % label, col, width - 2 * pad)
@@ -956,17 +1012,199 @@ class Browser:
                 self.text(cr, label_w + gap, y, value, col, width - label_w - gap - pad)
             y += lh + (6 if kind == "action" and key_is_group_end(key) else 0)
         if self.msg:
-            self.text(cr, pad, height - 4 * lh - 10, self.msg, WHITE, width - 2 * pad)
+            self.text(cr, pad, height - 4 * lh - 10, self.msg, INK, width - 2 * pad)
         if self.cfg_edit is not None:
             keys = [("Enter", "Accept"), ("Esc", "Cancel"), ("Ctrl+V", "Paste")]
         else:
-            keys = [("\u2191\u2193", "Select"), ("Enter", "Edit/Change/Run"), ("Esc", "Close without saving")]
+            keys = [("\u2191\u2193", "Select field"), ("Enter", "Edit field / change value / run action"), ("Esc", "Close without saving")]
         kh = lh + 2
         bh = self.draw_keys(cr, 0, 0, width - 2 * pad, kh, keys, draw=False) + 8
-        cr.set_source_rgb(0.15, 0.15, 0.15)
-        cr.rectangle(0, height - bh - 6, width, bh + 6)
-        cr.fill()
+        self.box(cr, -1, height - bh - 6, width + 2, bh + 7)
         self.draw_keys(cr, pad, height - bh - 2, width - 2 * pad, kh, keys)
+
+    # --- GEM-style decoration (modelled on a TOS 1.0 desktop screenshot)
+    HB = 18   # height of the horizontal scrollbar / size box row
+
+    def box(self, cr, x, y, w, h, shadow=False, bw=1):
+        """Grey box with a black border of bw px (and optional GEM drop shadow)."""
+        if shadow:
+            cr.set_source_rgb(*INK)
+            cr.rectangle(x + 4, y + 4, w, h)
+            cr.fill()
+        cr.set_source_rgb(*INK)
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(x + bw, y + bw, w - 2 * bw, h - 2 * bw)
+        cr.fill()
+
+    def arrow(self, cr, cx, cy, angle, size=12):
+        """Hollow GEM arrow (up = angle 0), centred on cx, cy."""
+        def poly(k):
+            hw, sw = 6 - k, 2.5 - k
+            top, hh, bot = -size / 2 + k * 0.5, 2.5, size / 2 - k
+            return [(0, top), (hw, top + 6 - k), (sw, top + 6 - k), (sw, bot),
+                    (-sw, bot), (-sw, top + 6 - k), (-hw, top + 6 - k)]
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(angle)
+        for k, col in ((0, INK), (1.6, PAPER)):
+            pts = poly(k)
+            cr.move_to(*pts[0])
+            for pt in pts[1:]:
+                cr.line_to(*pt)
+            cr.close_path()
+            cr.set_source_rgb(*col)
+            cr.fill()
+        cr.restore()
+
+    def menubar(self, cr, width, lh):
+        mh = lh + 4
+        cr.set_source_rgb(*INK)
+        cr.rectangle(0, 0, width, mh + 2)
+        cr.fill()
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(0, 0, width, mh)
+        cr.fill()
+        x = 14
+        for name in ("Desk", "File", "View", "Options"):
+            self.text(cr, x, 2, name, INK)
+            lay = self.layout(cr)
+            lay.set_text(name + "     ", -1)
+            x += lay.get_pixel_size()[0]
+        lay = self.layout(cr)
+        lay.set_text("SeekexecuTe", -1)
+        self.text(cr, width - lay.get_pixel_size()[0] - 14, 2, "SeekexecuTe", INK)
+        return mh + 2
+
+    def window(self, cr, x, y, w, h, title, info=None, lh=None):
+        """GEM window: thick border + shadow, closer/fuller boxes, dotted title
+        bar, info line, horizontal scrollbar and size box.
+        Returns the height of the decorated top part (title + info line)."""
+        lh = lh or self.line_h
+        th = lh + 4
+        self.box(cr, x, y, w, h, shadow=True, bw=2)
+        x0, y0, w0 = x + 2, y + 2, w - 4          # inside the border
+        cr.set_source_rgb(*INK)
+        # title bar: 2px-dot lattice on grey between closer and fuller box,
+        # each box set off by a thick black separator (as in TOS 1.0)
+        cr.rectangle(x0, y0 + th, w0, 2)
+        cr.fill()
+        cr.rectangle(x0 + th, y0, 3, th)
+        cr.rectangle(x0 + w0 - th - 3, y0, 3, th)
+        cr.fill()
+        for dy in range(y0 + 3, y0 + th - 3, 4):
+            for dx in range(x0 + th + 6, x0 + w0 - th - 7, 4):
+                cr.rectangle(dx, dy, 2, 2)
+        cr.fill()
+        c = th / 2
+        # closer box (left): grey, black hourglass/bow-tie (4 wedges to centre)
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(x0, y0, th, th)
+        cr.fill()
+        cr.set_source_rgb(*INK)
+        m = 4
+        L, R, T, B = x0 + m, x0 + th - m, y0 + m, y0 + th - m
+        cx_, cy_ = x0 + c, y0 + c
+        for pts in (((L, T), (L, B), (cx_ - 1, cy_)),        # left wedge
+                    ((R, T), (R, B), (cx_ + 1, cy_)),        # right wedge
+                    ((L + 3, T), (R - 3, T), (cx_, cy_ - 2)),    # top bar
+                    ((L + 3, B), (R - 3, B), (cx_, cy_ + 2))):   # bottom bar
+            cr.move_to(*pts[0])
+            for pt in pts[1:]:
+                cr.line_to(*pt)
+            cr.close_path()
+            cr.fill()
+        cr.rectangle(L + 3, T, th - 2 * m - 6, 3)
+        cr.rectangle(L + 3, B - 3, th - 2 * m - 6, 3)
+        cr.fill()
+        # fuller box (right): black corners, grey ring, black dot in centre
+        fx = x0 + w0 - th
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(fx, y0, th, th)
+        cr.fill()
+        cr.set_source_rgb(*INK)
+        k = 6
+        for qx, qy, sx_, sy_ in ((fx + 2, y0 + 2, 1, 1), (fx + th - 2, y0 + 2, -1, 1),
+                                 (fx + 2, y0 + th - 3, 1, -1), (fx + th - 2, y0 + th - 3, -1, -1)):
+            cr.move_to(qx, qy)
+            cr.line_to(qx + sx_ * k, qy)
+            cr.line_to(qx, qy + sy_ * k)
+            cr.close_path()
+            cr.fill()
+        cr.arc(fx + c, y0 + c, 3.2, 0, 2 * math.pi)
+        cr.fill()
+        # title text on a grey plate
+        maxw = w0 - 2 * th - 40
+        lay = self.layout(cr, maxw)
+        lay.set_text(title, -1)
+        tw = min(lay.get_pixel_size()[0], maxw)
+        tx = x0 + (w0 - tw) // 2
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(tx - 8, y0 + 1, tw + 16, th - 1)
+        cr.fill()
+        self.text(cr, tx, y0 + 2, title, INK, maxw, mid=True)
+        top = th + 1
+        # info line
+        if info is not None:
+            ih = lh
+            self.text(cr, x0 + 6, y0 + th + 3, info, INK, w0 - 12, mid=True)
+            cr.set_source_rgb(*INK)
+            cr.rectangle(x0, y0 + th + ih + 1, w0, 2)
+            cr.fill()
+            top = th + ih + 3
+        # bottom: horizontal scrollbar (arrow boxes) + size box
+        hb = self.HB
+        by = y0 + (h - 4) - hb
+        cr.set_source_rgb(*INK)
+        cr.rectangle(x0, by - 2, w0, 2)
+        cr.fill()
+        for bx, ang in ((x0, -math.pi / 2), (x0 + w0 - 2 * hb, math.pi / 2)):
+            self.box(cr, bx, by, hb, hb)
+            self.arrow(cr, bx + hb / 2, by + hb / 2, ang, 12)
+        # size box (bottom right): black field, grey lower-right corner
+        sx = x0 + w0 - hb
+        cr.set_source_rgb(*INK)
+        cr.rectangle(sx, by, hb, hb)
+        cr.fill()
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(sx + 2, by + 2, hb - 4, hb - 4)
+        cr.fill()
+        cr.set_source_rgb(*INK)
+        cr.move_to(sx + 2, by + 2)
+        cr.line_to(sx + hb - 2, by + 2)
+        cr.line_to(sx + 2, by + hb - 2)
+        cr.close_path()
+        cr.fill()
+        cr.move_to(sx + hb - 2, by + hb - 7)
+        cr.line_to(sx + hb - 2, by + hb - 2)
+        cr.line_to(sx + hb - 7, by + hb - 2)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*PAPER)
+        cr.set_line_width(1.5)
+        cr.move_to(sx + hb - 3, by + 4)
+        cr.line_to(sx + 4, by + hb - 3)
+        cr.stroke()
+        return top
+
+    def scrollbar(self, cr, x, y, h, pos, total, visible):
+        """GEM vertical scrollbar: arrow boxes, plain grey track, slider."""
+        w = 18
+        cr.set_source_rgb(*INK)
+        cr.rectangle(x, y, 2, h)
+        cr.fill()
+        for by, ang in ((y, 0), (y + h - w, math.pi)):
+            self.box(cr, x + 2, by, w - 2, w)
+            self.arrow(cr, x + 2 + (w - 2) / 2, by + w / 2, ang, 12)
+        track_y, track_h = y + w, h - 2 * w
+        if total > visible and track_h > 8:
+            sh = max(10, int(track_h * visible / total))
+            sy = track_y + int((track_h - sh) * pos / max(1, total - visible))
+        else:
+            return w
+        self.box(cr, x + 2, sy, w - 2, sh, bw=2)
+        return w
 
     # --- rysowanie
     def layout(self, cr, width=None, wrap=False, mid=False):
@@ -995,18 +1233,18 @@ class Browser:
             if cx > x and cx + kw + 6 + lw > x + maxw:
                 cx, cy = x, cy + lh + 6
             if draw:
-                cr.set_source_rgb(*WHITE)
+                cr.set_source_rgb(*INK)
                 cr.rectangle(cx, cy, kw, lh)
                 cr.fill()
-                cr.set_source_rgb(*BLACK)
+                cr.set_source_rgb(*PAPER)
                 cr.rectangle(cx + 1, cy + 1, kw - 2, lh - 2)
                 cr.set_line_width(1)
                 cr.stroke()
-                cr.set_source_rgb(*WHITE)
+                cr.set_source_rgb(*INK)
                 cr.rectangle(cx + 2, cy + 2, kw - 4, lh - 4)
                 cr.fill()
-                self.text(cr, cx + 6, cy + (lh - self.glyph_h) // 2, key, BLACK)
-                self.text(cr, cx + kw + 6, cy + (lh - self.glyph_h) // 2, label, WHITE)
+                self.text(cr, cx + 6, cy + (lh - self.glyph_h) // 2, key, PAPER)
+                self.text(cr, cx + kw + 6, cy + (lh - self.glyph_h) // 2, label, INK)
             cx += kw + 6 + lw + gap
         return cy + lh - y
 
@@ -1026,7 +1264,7 @@ class Browser:
         lay.set_text(longest, -1)
         return lay.get_pixel_size()[0]
 
-    def text(self, cr, x, y, s, color=WHITE, width=None, wrap=False, mid=False):
+    def text(self, cr, x, y, s, color=INK, width=None, wrap=False, mid=False):
         lay = self.layout(cr, width, wrap, mid)
         lay.set_text(s, -1)
         cr.set_source_rgb(*color)
@@ -1035,7 +1273,7 @@ class Browser:
         return lay.get_pixel_size()[1]
 
     def draw(self, area, cr, width, height):
-        cr.set_source_rgb(*BLACK)
+        cr.set_source_rgb(*DESKTOP)
         cr.paint()
         pad = 10
         lay = self.layout(cr)
@@ -1046,42 +1284,72 @@ class Browser:
         if self.cfg_mode:
             self.draw_settings(cr, width, height, lh)
             return
+        mh = self.menubar(cr, width, lh)
 
         # key bar at the bottom
-        keys = [("\u2191\u2193", "Move"), ("\u2192", "Open/Run"), ("\u2190", "Back"),
-                ("[ ]", "Page"), ("< >", "Top/End"), ("Space", "Wide list"),
-                ("- =", "Scroll text"), ("a", "Favorite"), ("Tab", "Favorites"),
-                ("t", "Machine/TOS"), ("c", "Settings"), ("f", "Fullscreen"),
-                ("R", "Rescan"), ("q", "Quit")]
+        # label tiers: short -> long; use the longest set that fits in 3 rows
+        tiers = [
+            [("\u2191\u2193", "Move"), ("Enter", "Open / run"), ("\u2190", "Back"),
+             ("[ ]", "Page"), (", .", "First / last"), ("Space", "Wide / preview"),
+             ("- =", "Scroll text"), ("a", "Favorite"), ("Tab", "Favorites"),
+             ("c", "Settings"), ("Esc", "Quit")],
+            [("\u2191\u2193", "Move selection"), ("Enter", "Open folder or run disk"),
+             ("\u2190", "Go back"), ("[ ]", "Page up and down"),
+             (", .", "First or last item"), ("Space", "Wide list or preview"),
+             ("- =", "Scroll description"), ("a", "Add or remove favorite"),
+             ("Tab", "Show favorites"), ("c", "Open settings"), ("Esc", "Quit program")],
+            [("\u2191\u2193", "Move selection up and down"),
+             ("Enter", "Open folder or run disk"), ("\u2190", "Go back one level"),
+             ("[ ]", "Page up and page down"), (", .", "Go to first or last item"),
+             ("Space", "Wide list or cover preview"), ("- =", "Scroll description text"),
+             ("a", "Add or remove favorite"), ("Tab", "Show favorites or all disks"),
+             ("c", "Open settings"), ("Esc", "Quit program")],
+        ]
         kh = lh + 2
+        keys = tiers[0]
+        for t in reversed(tiers):
+            if self.draw_keys(cr, 0, 0, width - 2 * pad, kh, t, draw=False) <= 3 * kh + 12:
+                keys = t
+                break
         help_h = self.draw_keys(cr, 0, 0, width - 2 * pad, kh, keys, draw=False) + 8
-        cr.set_source_rgb(0.15, 0.15, 0.15)
-        cr.rectangle(0, height - help_h - pad, width, help_h + pad)
-        cr.fill()
+        self.box(cr, -1, height - help_h - pad, width + 2, help_h + pad + 1)
         self.draw_keys(cr, pad, height - help_h - pad + 4, width - 2 * pad, kh, keys)
 
-        # pasek komunikatu
-        status_y = height - help_h - pad - lh
-        if self.msg:
-            self.text(cr, pad, status_y, self.msg, WHITE, width - 2 * pad)
-
-        # lewa kolumna: menedżer plików
+        # windows live between the menu bar and the key bar
+        win_top = mh + 10
+        win_bot = height - help_h - pad - 12
         items = self.items()
-        need = self.names_width(cr, items) + 2 * pad + 16
+        need = self.names_width(cr, items) + 2 * pad + 40
+        min_w = int(width * 0.30)            # never narrower than ~30% of the screen
         if self.wide:
-            # lista zajmuje prawie całą szerokość, po prawej wąski pasek
-            left_w = min(need, width - 60)
+            left_w = max(min(need, width - 60), min_w)
         else:
-            left_w = int(width * 0.42)      # jak dawniej: duża okładka i opis
+            left_w = int(width * 0.42)
+        right_x = left_w + 6
+        right_w = width - right_x - 12
+
+        # left window: file manager
         path = "/" + "/".join(self.disp) if self.disp else "/"
         if self.fav_mode:
             path = "FAVORITES (%d)" % len(self.favs)
-        self.text(cr, pad, pad, "ATARI ST  " + path, WHITE, left_w - 2 * pad, mid=True)
-        list_top = pad + lh + 6
-        cr.set_source_rgb(0.4, 0.4, 0.4)
-        cr.rectangle(pad, list_top - 3, left_w - 2 * pad, 1)
-        cr.fill()
-        list_h = status_y - list_top - 4
+        cur_item = items[self.cur] if items and 0 <= self.cur < len(items) else None
+        if self.msg:
+            info = self.msg
+        elif cur_item:
+            info = "%d / %d" % (self.cur + 1, len(items))
+            if cur_item[0] == "file":
+                full = self.fav_rels[self.cur] if self.fav_mode else cur_item[1]
+                info += "   " + full
+        else:
+            info = "0 items"
+        wx, ww = 8, left_w - 8
+        top_h = self.window(cr, wx, win_top, ww, win_bot - win_top, path, info)
+        list_top = win_top + top_h + 3
+        content_bot = win_bot - self.HB - 3
+        sbw = 18
+        lx = wx + 6
+        lw = ww - sbw - 8
+        list_h = content_bot - list_top
         self.rows = max(1, int(list_h // lh))
         self.cur = max(0, min(self.cur, len(items) - 1)) if items else 0
         if self.cur < self.top:
@@ -1095,80 +1363,93 @@ class Browser:
             y = list_top + i * lh
             s = self.item_text(idx, items[idx])
             if idx == self.cur:
-                cr.set_source_rgb(*WHITE)
-                cr.rectangle(pad, y, left_w - 2 * pad, lh)
+                cr.set_source_rgb(*INK)
+                cr.rectangle(wx + 1, y, ww - sbw - 2, lh)
                 cr.fill()
-                self.text(cr, pad + 4, y, s, BLACK, left_w - 2 * pad - 8, mid=True)
+                self.text(cr, lx, y + 2, s, PAPER, lw - 4, mid=True)
             else:
-                self.text(cr, pad + 4, y, s, WHITE, left_w - 2 * pad - 8, mid=True)
+                self.text(cr, lx, y + 2, s, INK, lw - 4, mid=True)
         if not items:
-            self.text(cr, pad, list_top, "(no favorites - press a on a disk)"
+            self.text(cr, lx, list_top, "(no favorites - press a on a disk)"
                       if self.fav_mode else "(empty)", GRAY)
-        # pozycja
-        if items and not self.msg:
-            self.text(cr, pad, status_y, "%d / %d" % (self.cur + 1, len(items)), GRAY, left_w - 2 * pad)
-            cur_item = items[self.cur]
-            if cur_item[0] == "file":
-                # pełna nazwa zaznaczonej dyskietki (gdy lista ją skróciła)
-                full = self.fav_rels[self.cur] if self.fav_mode else cur_item[1]
-                self.text(cr, pad + 110, status_y, full, GRAY,
-                          (width if self.wide else left_w) - 2 * pad - 110, mid=True)
+        self.scrollbar(cr, wx + ww - sbw - 1, list_top - 3, list_h + 3,
+                       self.top, len(items), self.rows)
 
-        # separator
-        cr.set_source_rgb(0.4, 0.4, 0.4)
-        cr.rectangle(left_w, pad, 1, status_y - pad)
-        cr.fill()
-
-        # prawa kolumna: okładka (góra) i opis (dół)
-        if self.wide:
+        # right window: cover (top) and description (bottom)
+        if right_w < 120:
             return
-        rx = left_w + pad
-        rw = width - rx - pad
-        avail_h = status_y - pad
-        cover_h = int(avail_h * 0.5)
         sel = self.selection()
         text, pb = self.cur_info
-        if sel and sel[0] == "dir":
+        hidden = self.wide or not sel
+        title = "Preview" if hidden else sel[1]
+        rinfo = None
+        if not hidden and sel[0] == "file" and self.max_scroll > 0:
+            rinfo = "- = / wheel: scroll description (%d%%)" % int(
+                100 * self.desc_scroll / self.max_scroll)
+        elif not hidden and sel[0] == "dir":
+            rinfo = "Folder - %d disks inside" % count_disks(sel[2])
+        elif not hidden:
+            rinfo = "Cover and description"
+        else:
+            rinfo = ""
+        rtop = self.window(cr, right_x, win_top, right_w, win_bot - win_top, title, rinfo)
+        rx = right_x + 8
+        rw = right_w - sbw - 12
+        top_y = win_top + rtop + 6
+        avail_h = content_bot - top_y
+        if hidden:
+            self.text(cr, rx, top_y + 4, "Nothing to display.\n\nPress SPACE to show or hide the preview.",
+                      GRAY, right_w - 16, wrap=True)
+            self.scrollbar(cr, right_x + right_w - sbw - 1, win_top + rtop, content_bot - win_top - rtop + 3,
+                           0, 1, 1)
+            return
+        cover_h = int(avail_h * 0.5)
+        sb_pos, sb_total, sb_vis = 0, 1, 1
+        if sel[0] == "dir":
             n = count_disks(sel[2])
-            self.text(cr, rx, pad, "Folder: %s" % sel[1], WHITE, rw)
-            self.text(cr, rx, pad + lh, "Disks inside: %d" % n, GRAY, rw)
-        elif sel:
+            self.text(cr, rx, top_y, "Folder: %s" % sel[1], INK, rw)
+            self.text(cr, rx, top_y + lh, "Disks inside: %d" % n, GRAY, rw)
+        else:
             if pb is not None:
                 pw, ph = pb.get_width(), pb.get_height()
                 s = min(rw / pw, cover_h / ph, 3.0)
                 dx = rx + (rw - pw * s) / 2
                 cr.save()
-                cr.translate(dx, pad)
+                cr.translate(dx, top_y)
                 cr.scale(s, s)
                 Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
                 cr.paint()
                 cr.restore()
+                cr.set_source_rgb(*INK)
+                cr.set_line_width(1)
+                cr.rectangle(dx - 0.5, top_y - 0.5, pw * s + 1, ph * s + 1)
+                cr.stroke()
             else:
                 msg = "(loading...)" if self.info_loading else "(no cover)"
-                self.text(cr, rx, pad, msg, GRAY, rw)
-            ty = pad + cover_h + 8
-            cr.set_source_rgb(0.4, 0.4, 0.4)
-            cr.rectangle(rx, ty - 4, rw, 1)
+                self.text(cr, rx, top_y, msg, GRAY, rw)
+            ty = top_y + cover_h + 8
+            cr.set_source_rgb(*INK)
+            cr.rectangle(right_x + 1, ty - 4, right_w - 2, 1)
             cr.fill()
             if text:
                 cr.save()
-                cr.rectangle(rx, ty, rw, status_y - ty)
+                cr.rectangle(rx, ty, rw, content_bot - ty)
                 cr.clip()
                 lay = self.layout(cr, rw, wrap=True)
                 lay.set_text(text, -1)
                 total = lay.get_pixel_size()[1]
-                self.max_scroll = max(0, total - (status_y - ty))
+                self.max_scroll = max(0, total - (content_bot - ty))
                 self.desc_scroll = max(0, min(self.desc_scroll, self.max_scroll))
-                cr.set_source_rgb(*WHITE)
+                cr.set_source_rgb(*INK)
                 cr.move_to(rx, ty - self.desc_scroll)
                 PangoCairo.show_layout(cr, lay)
                 cr.restore()
-                if self.max_scroll > 0 and not self.msg:
-                    pct = int(100 * self.desc_scroll / self.max_scroll)
-                    self.text(cr, rx, status_y, "description: - = / mouse wheel: scroll (%d%%)" % pct, GRAY, rw)
+                sb_pos, sb_total, sb_vis = self.desc_scroll, self.max_scroll + (content_bot - ty), content_bot - ty
             else:
                 msg = "(loading...)" if self.info_loading else "(no description)"
                 self.text(cr, rx, ty, msg, GRAY, rw)
+        self.scrollbar(cr, right_x + right_w - sbw - 1, win_top + rtop, content_bot - win_top - rtop + 3,
+                       sb_pos, sb_total, sb_vis)
 
 
 def main():
