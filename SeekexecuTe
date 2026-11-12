@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+"""SeekexecuTe - graphical Atari ST floppy browser (NAS archive) for Hatari.
+
+Usage:
+    SeekexecuTe             run (uses the cache)
+    SeekexecuTe --rescan    rescan the archive first and refresh the cache
+
+Three panes: file manager (left), cover (top right), description (bottom right).
+Font: "Atari ST" by Patrick H. Lauke (FontStruct, CC BY) - see readme in ~/.local/share/fonts.
+Keys: see the key bar at the bottom of the screen.
+"""
+import os
+import re
+import subprocess
+import sys
+import threading
+import textwrap  # noqa: F401  (zostawione na wypadek rozszerzeń)
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+
+CONFIG_FILE = os.path.expanduser("~/.config/SeekexecuTe/config.json")
+CRED_FILE = os.path.expanduser("~/.config/SeekexecuTe/nas.cred")
+LEGACY_ROOT = os.path.expanduser("~/atarist/ATARI_ST")
+LEGACY_CACHE = os.path.expanduser("~/.cache/SeekexecuTe/index.txt")
+DEFAULT_CFG = {
+    "archive_root": LEGACY_ROOT,      # folder z archiwum dyskietek
+    "mount_nas": True,                # czy montować dysk sieciowy przy starcie
+    "nas_share": "//nas-host/share/ATARI_ST",   # //adres/udział[/podfolder]
+    "nas_user": "",                   # puste = gość (bez hasła)
+    "smb_version": "3.0",             # "" = automatycznie
+    "preset": "1040STFM  TOS 1.04 GB",   # maszyna + TOS dla Hatari
+}
+SMB_VERSIONS = ["", "3.0", "2.1", "2.0", "1.0"]
+TOS_DIR = os.path.expanduser("~/atarist/tos")
+# (nazwa, maszyna Hatari, RAM w KB, obraz TOS)  - tylko ST i STE
+PRESETS = [
+    ("520ST    TOS 1.00 GB", "st", 512, "tos100gb.img"),
+    ("1040ST   TOS 1.02 GB", "st", 1024, "tos102gb.img"),
+    ("1040STFM TOS 1.04 GB", "st", 1024, "tos104gb.img"),
+    ("1040STFM EmuTOS 1.2 PL", "st", 1024, "etos512pl.img"),
+    ("1040STE  TOS 1.06 GB", "ste", 1024, "tos106gb.img"),
+    ("1040STE  TOS 1.62 GB", "ste", 1024, "tos162gb.img"),
+    ("1040STE  EmuTOS 1.2 PL", "ste", 1024, "etos512pl.img"),
+]
+PRESET_NAMES = [p[0] for p in PRESETS]
+CFG = dict(DEFAULT_CFG)
+MOUNT = LEGACY_ROOT
+CACHE = LEGACY_CACHE
+HA = os.path.expanduser("~/.local/bin/ha")
+FAV_FILE = os.path.expanduser("~/.config/SeekexecuTe/favorites.txt")
+CATS_FILE = os.path.expanduser("~/.config/SeekexecuTe/categories.json")
+CATEGORY_NAMES = {
+    "PC": "Point And Click Adventures",
+    "FD": "Fire And Destroy",
+    "ST": "Strategy",
+    "JR": "Jump And Run",
+    "TA": "Text Adventure",
+}
+CAT_ROOT = "BY CATEGORY"
+
+DISK_EXT = {".st", ".msa", ".stx", ".zip"}
+SKIP_DIRS = {"Extras", "Screenshots", "Emulators", "Music", "Gfx", "Help",
+             "Online Magazines", "GamebaseST v3.1d packed", "Installers",
+             "Splash", "Sounds", "Scripts", "Shortcuts", "TOS", "HD",
+             "UTILS", "MODULES", "web", "Sources", "ULSV3"}
+IMG_EXT = (".png", ".jpg", ".jpeg", ".gif")
+FONT = "Atari ST"
+FONT_PX = 16      # the font is an 8x8 pixel grid: 16 px = crisp 2x scale
+
+WHITE = (1, 1, 1)
+GRAY = (0.6, 0.6, 0.6)
+BLACK = (0, 0, 0)
+
+
+# ------------------------------------------------------------- konfiguracja
+def load_config():
+    cfg = dict(DEFAULT_CFG)
+    try:
+        import json
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            cfg.update({k: v for k, v in json.load(fh).items() if k in DEFAULT_CFG})
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    import json
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+
+
+def current_preset():
+    for p in PRESETS:
+        if p[0] == CFG.get("preset"):
+            return p
+    return PRESETS[2]
+
+
+def load_password():
+    try:
+        for ln in open(CRED_FILE, encoding="utf-8"):
+            if ln.startswith("password="):
+                return ln[len("password="):].rstrip("\n")
+    except OSError:
+        pass
+    return ""
+
+
+def write_credentials(user, password):
+    """Plik z danymi logowania, tylko do odczytu przez właściciela (0600)."""
+    os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+    if not user:
+        try:
+            os.remove(CRED_FILE)
+        except OSError:
+            pass
+        return
+    fd = os.open(CRED_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("username=%s\npassword=%s\n" % (user, password))
+
+
+def apply_config(cfg):
+    """Ustawia globalne MOUNT i CACHE na podstawie konfiguracji."""
+    global CFG, MOUNT, CACHE
+    CFG = dict(cfg)
+    MOUNT = os.path.expanduser(cfg["archive_root"]).rstrip("/") or "/"
+    if MOUNT == LEGACY_ROOT and os.path.isfile(LEGACY_CACHE):
+        CACHE = LEGACY_CACHE
+    else:
+        import hashlib
+        h = hashlib.sha1(MOUNT.encode()).hexdigest()[:10]
+        CACHE = os.path.expanduser("~/.cache/SeekexecuTe/index-%s.txt" % h)
+
+
+def root_ready():
+    """Czy archiwum jest dostępne (folder istnieje, a dysk sieciowy zamontowany)."""
+    return os.path.isdir(MOUNT) and (not CFG["mount_nas"] or os.path.ismount(MOUNT))
+
+
+# ---------------------------------------------------------------- montowanie
+def mount_nas(cfg, gui):
+    """Montuje udział sieciowy. gui=True: bez pytania o hasło w terminalu (sudo -n, potem pkexec)."""
+    share = cfg["nas_share"].strip()
+    if not share.startswith("//"):
+        return False, "Share must look like //host/share[/subfolder]."
+    try:
+        os.makedirs(MOUNT, exist_ok=True)
+    except OSError as e:
+        return False, "Cannot create folder %s: %s" % (MOUNT, e)
+    opts = ["uid=%d" % os.getuid(), "gid=%d" % os.getgid(), "iocharset=utf8"]
+    if cfg["smb_version"]:
+        opts.append("vers=%s" % cfg["smb_version"])
+    if cfg["nas_user"] and os.path.isfile(CRED_FILE):
+        opts.append("credentials=%s" % CRED_FILE)
+    else:
+        opts.append("guest")
+    cmd = ["mount.cifs", share, MOUNT, "-o", ",".join(opts)]
+    attempts = [["sudo", "-n"], ["pkexec"]] if gui else [["sudo"]]
+    for prefix in attempts:
+        try:
+            r = subprocess.run(prefix + cmd, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, timeout=90,
+                               stdin=subprocess.DEVNULL if gui else None)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            last = str(e)
+            continue
+        if r.returncode == 0 and os.path.ismount(MOUNT):
+            return True, "Mounted: %s" % share
+        last = (r.stderr or "").strip().splitlines()[-1:] or ["mount error"]
+        last = last[0]
+    return False, "Mount failed: %s" % last
+
+
+def ensure_mounted():
+    if not CFG["mount_nas"]:
+        if os.path.isdir(MOUNT):
+            return True, ""
+        return False, "Archive folder does not exist: %s" % MOUNT
+    if os.path.ismount(MOUNT):
+        return True, ""
+    print("Network drive not mounted - mounting %s ..." % MOUNT)
+    ok, msg = mount_nas(CFG, gui=False)
+    return ok, "" if ok else msg
+
+
+# --------------------------------------------------------------------- cache
+def rescan(progress=None):
+    found = []
+    for root, dirs, files in os.walk(MOUNT):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for f in sorted(files):
+            if os.path.splitext(f)[1].lower() in DISK_EXT:
+                found.append(os.path.relpath(os.path.join(root, f), MOUNT))
+        if progress:
+            progress(len(found))
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(found) + "\n")
+    return found
+
+
+def load_cache():
+    with open(CACHE, encoding="utf-8") as fh:
+        return [ln.rstrip("\n") for ln in fh if ln.strip()]
+
+
+def load_favs():
+    try:
+        with open(FAV_FILE, encoding="utf-8") as fh:
+            return [ln.rstrip("\n") for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def save_favs(favs):
+    os.makedirs(os.path.dirname(FAV_FILE), exist_ok=True)
+    with open(FAV_FILE, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(favs) + ("\n" if favs else ""))
+
+
+def load_categories():
+    """{kod: [ścieżki względne]} albo {} gdy nie ma pliku."""
+    try:
+        import json
+        with open(CATS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def new_node():
+    return {"dirs": {}, "files": [], "count": None}
+
+
+def build_tree(paths, cats=None):
+    root = new_node()
+    for p in paths:
+        parts = p.split("/")
+        node = root
+        for d in parts[:-1]:
+            node = node["dirs"].setdefault(d, new_node())
+        node["files"].append(parts[-1])
+    if cats:
+        have = set(paths)
+        catroot = new_node()
+        for code, name in CATEGORY_NAMES.items():
+            rels = [r for r in cats.get(code, []) if r in have]
+            if not rels:
+                continue
+            node = new_node()
+            node["relmap"] = {}
+            for r in sorted(rels):
+                label = os.path.basename(r)
+                if label in node["relmap"]:     # ta sama nazwa w ST/STX/HD
+                    fmt = r.split("/")[-3] if len(r.split("/")) >= 3 else "?"
+                    label = "%s  (%s)" % (label, fmt)
+                node["relmap"][label] = r
+            node["files"] = list(node["relmap"])
+            catroot["dirs"][name] = node
+        if catroot["dirs"]:
+            root["dirs"][CAT_ROOT] = catroot
+    return root
+
+
+def count_disks(node):
+    if node["count"] is None:
+        node["count"] = len(node["files"]) + sum(count_disks(n) for n in node["dirs"].values())
+    return node["count"]
+
+
+def collapse(node, name):
+    while not node["files"] and len(node["dirs"]) == 1:
+        (n, sub), = node["dirs"].items()
+        name += "/" + n
+        node = sub
+    return name, node
+
+
+MAX_FLAT = 50   # więcej plików w folderze => podział na grupy literowe
+
+
+def _bucket_key(name, plen):
+    k = name[:plen].upper()
+    if not k or not k[0].isalpha():
+        return "0-9"
+    return k
+
+
+def listing(node):
+    """Lista pozycji (rodzaj, etykieta, węzeł, wirtualny); liczona raz na węzeł."""
+    if "_list" in node:
+        return node["_list"]
+    items = []
+    for name in sorted(node["dirs"], key=lambda n: (n != CAT_ROOT, n.lower())):
+        label, sub = collapse(node["dirs"][name], name)
+        items.append(("dir", label, sub, False))
+    files = sorted(node["files"], key=str.lower)
+    if len(files) <= MAX_FLAT:
+        items += [("file", f, None, False) for f in files]
+    else:
+        plen = node.get("plen", 1)
+        buckets = {}
+        while True:
+            buckets = {}
+            for f in files:
+                buckets.setdefault(_bucket_key(f, plen), []).append(f)
+            if len(buckets) > 1 or plen >= 8:
+                break
+            plen += 1
+        for key in sorted(buckets, key=lambda k: (k != "0-9", k)):
+            sub = new_node()
+            sub["files"] = buckets[key]
+            sub["plen"] = plen + 1
+            if "relmap" in node:
+                sub["relmap"] = node["relmap"]
+            items.append(("dir", key, sub, True))
+    node["_list"] = items
+    return items
+
+
+def contains(node, name):
+    if name in node["files"]:
+        return True
+    return any(contains(n, name) for n in node["dirs"].values())
+
+
+# ------------------------------------------------------ opis i okładka (opcj.)
+def _variants(stem):
+    """Nazwa dyskietki oraz wersja bez (nawiasów) i [nawiasów]."""
+    out = [stem]
+    stripped = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", stem).strip()
+    if stripped and stripped not in out:
+        out.append(stripped)
+    return out
+
+
+def _gb_base(rel):
+    parts = rel.split("/")
+    if "Games" in parts:
+        i = len(parts) - 1 - parts[::-1].index("Games")
+        if len(parts) >= i + 4:
+            return os.path.join(MOUNT, *parts[:i]), parts[i + 2]
+    return None, None
+
+
+def find_description(rel):
+    full = os.path.join(MOUNT, rel)
+    stem, d = os.path.splitext(os.path.basename(full))[0], os.path.dirname(full)
+    cands = [os.path.join(d, stem + e) for e in (".txt", ".nfo", ".diz", ".TXT")]
+    base, letter = _gb_base(rel)
+    if base:
+        for v in _variants(stem):
+            cands.append(os.path.join(base, "Extras", "Instructions", letter, v + ".txt"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def find_cover(rel):
+    full = os.path.join(MOUNT, rel)
+    stem, d = os.path.splitext(os.path.basename(full))[0], os.path.dirname(full)
+    cands = [os.path.join(d, stem + e) for e in IMG_EXT]
+    base, letter = _gb_base(rel)
+    if base:
+        for v in _variants(stem):
+            for e in IMG_EXT:
+                cands.append(os.path.join(base, "Extras", "Boxscans", letter, v + " - front" + e))
+        for v in _variants(stem):
+            for e in IMG_EXT:
+                cands.append(os.path.join(base, "Screenshots", letter, v.replace(" ", "_") + "_1" + e))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def read_text(path):
+    raw = open(path, "rb").read(120000)
+    for enc in ("utf-8", "cp1250", "cp1252"):
+        try:
+            return raw.decode(enc).replace("\r", "")
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("latin-1", "replace").replace("\r", "")
+
+
+def load_pixbuf(path):
+    pb = GdkPixbuf.Pixbuf.new_from_file(path)
+    w, h = pb.get_width(), pb.get_height()
+    if max(w, h) > 1400:
+        s = 1400.0 / max(w, h)
+        pb = pb.scale_simple(int(w * s), int(h * s), GdkPixbuf.InterpType.BILINEAR)
+    return pb
+
+
+def key_is_group_end(key):
+    return key in ("_choose", "_mount")
+
+
+# ---------------------------------------------------------------- aplikacja
+class Browser:
+    def __init__(self, root, nas_ok):
+        self.root = root
+        self.nas_ok = nas_ok
+        self.node, self.trail, self.disp = root, [], []
+        self.stack = []
+        self.cur = self.top = 0
+        self.msg = "" if nas_ok else "WARNING: archive unavailable - press c to open settings."
+        self.token = 0
+        self.timer = None
+        self.cache = {}                 # rel -> (opis, pixbuf)
+        self.cur_info = (None, None)    # (tekst opisu, pixbuf) dla zaznaczenia
+        self.info_loading = False
+        self.desc_scroll = 0
+        self.line_h = 24
+        self.max_scroll = 0
+        self.hatari = None
+        self.scanning = False
+        self.rows = 10
+        self.cfg_mode = False
+        self.cfg_work = None
+        self.cfg_pass = ""
+        self.cfg_cur = 0
+        self.cfg_edit = None     # indeks edytowanego pola tekstowego
+        self.cfg_buf = ""
+        self.favs = load_favs()
+        self.fav_mode = False
+        self.fav_rels = []
+        self.other_pos = (0, 0)         # zapamiętana pozycja drugiego widoku
+        self.wide = False               # spacja: lista na całą szerokość, prawe panele schowane
+
+        self.win = None
+        self.area = None
+
+    # --- okno
+    def activate(self, app):
+        self.win = Gtk.ApplicationWindow(application=app, title="Atari ST")
+        self.win.set_default_size(1280, 720)
+        css = Gtk.CssProvider()
+        css.load_from_string("window, drawingarea { background: #000; }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.area = Gtk.DrawingArea()
+        self.area.set_hexpand(True)
+        self.area.set_vexpand(True)
+        self.area.set_draw_func(self.draw)
+        self.win.set_child(self.area)
+        key = Gtk.EventControllerKey()
+        key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)   # Tab nie może iść do nawigacji fokusu
+        key.connect("key-pressed", self.on_key)
+        self.win.add_controller(key)
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self.on_wheel)
+        self.win.add_controller(wheel)
+        self.win.maximize()
+        self.win.present()
+        if getattr(self, "open_settings_on_start", False):
+            self.open_settings()
+            self.msg = "Archive unavailable - set a folder or network drive."
+        if os.environ.get("ATARI_MENU_OPEN_SETTINGS"):     # tylko do testów
+            self.open_settings()
+        goto = os.environ.get("ATARI_MENU_GOTO")      # tylko do testów
+        if goto:
+            self.goto(goto)
+        else:
+            self.schedule_info()
+
+    def goto(self, rel):
+        parts = rel.split("/")
+        name = parts[-1]
+        for _ in range(40):
+            items = listing(self.node)
+            for idx, (kind, label, sub, virt) in enumerate(items):
+                if kind == "file" and label == name:
+                    self.cur = idx
+                    self.schedule_info()
+                    return
+            for idx, (kind, label, sub, virt) in enumerate(items):
+                if kind == "dir" and contains(sub, name) and (
+                        virt or label.split("/")[0] in parts):
+                    self.enter(idx)
+                    break
+            else:
+                break
+        self.schedule_info()
+
+    def enter(self, idx):
+        kind, label, sub, virt = listing(self.node)[idx]
+        self.stack.append((self.node, self.trail, self.disp, self.cur, self.top))
+        if not virt:
+            self.trail = self.trail + label.split("/")
+        self.disp = self.disp + [label]
+        self.node, self.cur, self.top = sub, 0, 0
+
+    # --- zaznaczenie, ładowanie opisu/okładki
+    def items(self):
+        if self.fav_mode:
+            self.fav_rels = sorted(self.favs, key=lambda r: os.path.basename(r).lower())
+            return [("file", os.path.basename(r), None, False) for r in self.fav_rels]
+        return listing(self.node)
+
+    def selection(self):
+        items = self.items()
+        if items and 0 <= self.cur < len(items):
+            return items[self.cur]
+        return None
+
+    def rel_of(self, label):
+        relmap = self.node.get("relmap")
+        if relmap:
+            return relmap.get(label, label)
+        return "/".join(self.trail + [label])
+
+    def selected_rel(self):
+        sel = self.selection()
+        if sel and sel[0] == "file":
+            if self.fav_mode:
+                return self.fav_rels[self.cur]
+            return self.rel_of(sel[1])
+        return None
+
+    def schedule_info(self):
+        self.token += 1
+        self.desc_scroll = 0
+        self.cur_info = (None, None)
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        rel = self.selected_rel()
+        if rel is None:
+            self.info_loading = False
+            self.area.queue_draw()
+            return
+        if rel in self.cache:
+            self.cur_info = self.cache[rel]
+            self.info_loading = False
+        else:
+            self.info_loading = True
+            self.timer = GLib.timeout_add(120, self.start_load, rel, self.token)
+        self.area.queue_draw()
+
+    def start_load(self, rel, token):
+        self.timer = None
+        threading.Thread(target=self.load_info, args=(rel, token), daemon=True).start()
+        return False
+
+    def load_info(self, rel, token):
+        text = pb = None
+        try:
+            d = find_description(rel)
+            if d:
+                text = read_text(d)
+        except Exception:
+            pass
+        try:
+            c = find_cover(rel)
+            if c:
+                pb = load_pixbuf(c)
+        except Exception:
+            pass
+        GLib.idle_add(self.info_ready, rel, token, text, pb)
+
+    def info_ready(self, rel, token, text, pb):
+        self.cache[rel] = (text, pb)
+        if token == self.token:
+            self.cur_info = (text, pb)
+            self.info_loading = False
+            self.area.queue_draw()
+        return False
+
+    # --- klawisze
+    def on_key(self, ctrl, keyval, keycode, state):
+        items = self.items()
+        n = len(items)
+        old = (self.cur, id(self.node), self.fav_mode, len(self.favs))
+        K = Gdk
+        if self.cfg_mode:
+            return self.settings_key(keyval, state)
+        if self.scanning:
+            return True
+        self.msg = ""
+        if keyval in (K.KEY_Down, K.KEY_j):
+            self.cur = min(self.cur + 1, n - 1)
+        elif keyval in (K.KEY_Up, K.KEY_k):
+            self.cur = max(self.cur - 1, 0)
+        elif keyval == K.KEY_bracketright:
+            self.cur = min(self.cur + max(self.rows - 1, 1), n - 1)
+        elif keyval == K.KEY_bracketleft:
+            self.cur = max(self.cur - max(self.rows - 1, 1), 0)
+        elif keyval == K.KEY_less:
+            self.cur = 0
+        elif keyval == K.KEY_greater:
+            self.cur = max(n - 1, 0)
+        elif keyval in (K.KEY_Right, K.KEY_Return, K.KEY_KP_Enter):
+            self.activate_item()
+        elif keyval in (K.KEY_Left, K.KEY_Escape, K.KEY_BackSpace):
+            if self.fav_mode:
+                self.toggle_fav_view()
+            elif self.stack:
+                self.node, self.trail, self.disp, self.cur, self.top = self.stack.pop()
+        elif keyval == K.KEY_Tab:
+            self.toggle_fav_view()
+        elif keyval == K.KEY_space:
+            self.wide = not self.wide
+        elif keyval in (K.KEY_a, K.KEY_A):
+            self.toggle_favorite()
+        elif keyval == K.KEY_minus:
+            self.desc_scroll = max(0, self.desc_scroll - 3 * self.line_h)
+        elif keyval in (K.KEY_equal, K.KEY_plus):
+            self.desc_scroll += 3 * self.line_h
+        elif keyval == K.KEY_f:
+            if self.win.is_fullscreen():
+                self.win.unfullscreen()
+            else:
+                self.win.fullscreen()
+        elif keyval in (K.KEY_R, K.KEY_r):
+            self.start_rescan()
+        elif keyval in (K.KEY_t, K.KEY_T):
+            self.cycle_preset((-1 if state & Gdk.ModifierType.SHIFT_MASK else 1))
+        elif keyval in (K.KEY_c, K.KEY_C):
+            self.open_settings()
+        elif keyval in (K.KEY_q, K.KEY_Q):
+            self.win.close()
+        else:
+            return False
+        if (self.cur, id(self.node), self.fav_mode, len(self.favs)) != old:
+            self.schedule_info()
+        self.area.queue_draw()
+        return True
+
+    def cycle_preset(self, step):
+        global CFG
+        i = PRESET_NAMES.index(CFG["preset"]) if CFG["preset"] in PRESET_NAMES else 2
+        CFG["preset"] = PRESET_NAMES[(i + step) % len(PRESETS)]
+        try:
+            save_config(CFG)
+        except OSError:
+            pass
+        self.msg = "Machine: " + " ".join(CFG["preset"].split())
+
+    def toggle_fav_view(self):
+        self.cur, self.top, self.other_pos = self.other_pos[0], self.other_pos[1], (self.cur, self.top)
+        self.fav_mode = not self.fav_mode
+
+    def toggle_favorite(self):
+        rel = self.selected_rel()
+        if rel is None:
+            self.msg = "Favorites: select a disk (not a folder)."
+            return
+        if rel in self.favs:
+            self.favs.remove(rel)
+            self.msg = "Removed from favorites: " + os.path.basename(rel)
+        else:
+            self.favs.append(rel)
+            self.msg = "Added to favorites: " + os.path.basename(rel)
+        save_favs(self.favs)
+        n = len(self.items())
+        self.cur = max(0, min(self.cur, n - 1))
+
+    def on_wheel(self, ctrl, dx, dy):
+        self.desc_scroll = max(0, self.desc_scroll + int(dy * 3 * self.line_h))
+        self.area.queue_draw()
+        return True
+
+    def activate_item(self):
+        sel = self.selection()
+        if not sel:
+            return
+        if sel[0] == "dir":
+            self.enter(self.cur)
+            return
+        if self.hatari and self.hatari.poll() is None:
+            self.msg = "Hatari is already running."
+            return
+        if not root_ready():
+            self.msg = "Archive unavailable (drive not mounted?). Settings: c"
+            return
+        rel = self.selected_rel()
+        pname, machine, mem, tos = current_preset()
+        self.hatari = subprocess.Popen([HA, "-m", machine, "-M", str(mem),
+                                        "-t", os.path.join(TOS_DIR, tos),
+                                        os.path.join(MOUNT, rel)])
+        self.msg = "Started Hatari (%s): %s" % (" ".join(pname.split()), sel[1])
+        GLib.timeout_add(700, self.watch_hatari)
+
+    def watch_hatari(self):
+        if self.hatari and self.hatari.poll() is None:
+            return True
+        self.msg = ""
+        self.area.queue_draw()
+        return False
+
+    def start_rescan(self):
+        if not root_ready():
+            self.msg = "Cannot scan: archive unavailable. Settings: c"
+            return
+        self.scanning = True
+        self.msg = "Scanning drive..."
+
+        def work():
+            def prog(n):
+                GLib.idle_add(self.set_msg, "Scanning drive... %d disks" % n)
+            paths = rescan(prog)
+            GLib.idle_add(self.rescan_done, paths)
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_msg(self, m):
+        self.msg = m
+        self.area.queue_draw()
+        return False
+
+    def rescan_done(self, paths):
+        self.root = build_tree(paths, load_categories())
+        self.node, self.trail, self.disp, self.stack = self.root, [], [], []
+        self.fav_mode = False
+        self.cur = self.top = 0
+        self.cache.clear()
+        self.scanning = False
+        self.msg = "Cache refreshed: %d disks." % len(paths)
+        self.schedule_info()
+        return False
+
+    # --- ustawienia
+    CFG_ROWS = [
+        ("archive_root", "Archive folder", "text"),
+        ("_choose", "Choose archive folder...", "action"),
+        ("mount_nas", "Mount network drive (NAS)", "bool"),
+        ("nas_share", "Network share (//host/share/subfolder)", "text"),
+        ("nas_user", "User (empty = guest)", "text"),
+        ("nas_pass", "Password", "pass"),
+        ("preset", "Hatari machine + TOS", "preset"),
+        ("smb_version", "SMB version (empty = auto)", "cycle"),
+        ("_mount", "Mount now (test)", "action"),
+        ("_save", "Save and apply", "action"),
+        ("_cancel", "Cancel", "action"),
+    ]
+
+    def open_settings(self):
+        self.cfg_work = dict(CFG)
+        self.cfg_pass = load_password()
+        self.cfg_cur = 0
+        self.cfg_edit = None
+        self.cfg_mode = True
+        self.msg = ""
+
+    def close_settings(self):
+        self.cfg_mode = False
+        self.cfg_edit = None
+        self.cfg_work = None
+        self.cfg_pass = ""     # nie trzymamy hasła w pamięci dłużej niż trzeba
+
+    def settings_key(self, keyval, state):
+        K = Gdk
+        rows = self.CFG_ROWS
+        if self.scanning:
+            return True
+        # --- edycja tekstu
+        if self.cfg_edit is not None:
+            key = rows[self.cfg_edit][0]
+            if keyval in (K.KEY_Return, K.KEY_KP_Enter):
+                if key == "nas_pass":
+                    self.cfg_pass = self.cfg_buf
+                else:
+                    self.cfg_work[key] = self.cfg_buf
+                self.cfg_edit = None
+            elif keyval == K.KEY_Escape:
+                self.cfg_edit = None
+            elif keyval == K.KEY_BackSpace:
+                self.cfg_buf = self.cfg_buf[:-1]
+            elif (state & Gdk.ModifierType.CONTROL_MASK) and keyval in (K.KEY_v, K.KEY_V):
+                def got(clip, res):
+                    try:
+                        t = clip.read_text_finish(res)
+                    except Exception:
+                        t = None
+                    if t and self.cfg_edit is not None:
+                        self.cfg_buf += t.replace("\n", "").replace("\r", "")
+                        self.area.queue_draw()
+                self.win.get_clipboard().read_text_async(None, got)
+            elif not (state & Gdk.ModifierType.CONTROL_MASK):
+                ch = Gdk.keyval_to_unicode(keyval)
+                if ch >= 32:
+                    self.cfg_buf += chr(ch)
+            self.area.queue_draw()
+            return True
+        # --- nawigacja po polach
+        if keyval == K.KEY_Down:
+            self.cfg_cur = min(self.cfg_cur + 1, len(rows) - 1)
+        elif keyval == K.KEY_Up:
+            self.cfg_cur = max(self.cfg_cur - 1, 0)
+        elif keyval in (K.KEY_Escape, K.KEY_Left):
+            self.close_settings()
+        elif keyval in (K.KEY_Return, K.KEY_KP_Enter, K.KEY_Right):
+            self.settings_activate()
+        else:
+            return False
+        self.area.queue_draw()
+        return True
+
+    def settings_activate(self):
+        key, _label, kind = self.CFG_ROWS[self.cfg_cur]
+        if kind in ("text", "pass"):
+            self.cfg_edit = self.cfg_cur
+            self.cfg_buf = self.cfg_pass if kind == "pass" else str(self.cfg_work[key])
+        elif kind == "bool":
+            self.cfg_work[key] = not self.cfg_work[key]
+        elif kind == "preset":
+            cur = self.cfg_work[key]
+            i = PRESET_NAMES.index(cur) if cur in PRESET_NAMES else 2
+            self.cfg_work[key] = PRESET_NAMES[(i + 1) % len(PRESETS)]
+        elif kind == "cycle":
+            cur = self.cfg_work[key]
+            i = SMB_VERSIONS.index(cur) if cur in SMB_VERSIONS else 0
+            self.cfg_work[key] = SMB_VERSIONS[(i + 1) % len(SMB_VERSIONS)]
+        elif key == "_choose":
+            self.choose_folder()
+        elif key == "_mount":
+            self.settings_mount()
+        elif key == "_save":
+            self.settings_save()
+        elif key == "_cancel":
+            self.close_settings()
+
+    def choose_folder(self):
+        if not hasattr(Gtk, "FileDialog"):
+            self.msg = "This GTK has no folder chooser - type the path by hand."
+            return
+        dlg = Gtk.FileDialog()
+        dlg.set_title("Choose archive folder")
+
+        def done(d, res):
+            try:
+                f = d.select_folder_finish(res)
+            except Exception:
+                return
+            if f and f.get_path() and self.cfg_work is not None:
+                self.cfg_work["archive_root"] = f.get_path()
+                self.cfg_work["mount_nas"] = False   # zwykły folder lokalny
+                self.area.queue_draw()
+        dlg.select_folder(self.win, None, done)
+
+    def settings_mount(self):
+        self.scanning = True
+        self.msg = "Mounting..."
+        cfg = dict(self.cfg_work)
+
+        def work():
+            write_credentials(cfg["nas_user"], self.cfg_pass)
+            old = (CFG, MOUNT, CACHE)
+            apply_config(cfg)
+            if os.path.ismount(MOUNT):
+                ok, msg = True, "Already mounted: %s" % MOUNT
+            else:
+                ok, msg = mount_nas(cfg, gui=True)
+            apply_config(old[0])      # test nie zmienia aktywnej konfiguracji
+            GLib.idle_add(self.settings_mount_done, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def settings_mount_done(self, msg):
+        self.scanning = False
+        self.msg = msg
+        self.area.queue_draw()
+        return False
+
+    def settings_save(self):
+        cfg = dict(self.cfg_work)
+        if not cfg["archive_root"].strip():
+            self.msg = "Enter the archive folder."
+            return
+        self.scanning = True
+        self.msg = "Saving and applying settings..."
+        password = self.cfg_pass
+
+        def work():
+            save_config(cfg)
+            write_credentials(cfg["nas_user"], password)
+            apply_config(cfg)
+            ok, msg = True, ""
+            if cfg["mount_nas"] and not os.path.ismount(MOUNT):
+                ok, msg = mount_nas(cfg, gui=True)
+            GLib.idle_add(self.settings_saved, ok, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def settings_saved(self, ok, msg):
+        self.scanning = False
+        self.close_settings()
+        self.nas_ok = root_ready()
+        self.cache.clear()
+        if not self.nas_ok:
+            self.root = build_tree([], load_categories())
+            self.node, self.trail, self.disp, self.stack = self.root, [], [], []
+            self.cur = self.top = 0
+            self.msg = msg or "Archive unavailable."
+            self.schedule_info()
+            return False
+        if os.path.isfile(CACHE):
+            paths = load_cache()
+            self.root = build_tree(paths, load_categories())
+            self.node, self.trail, self.disp, self.stack = self.root, [], [], []
+            self.fav_mode = False
+            self.cur = self.top = 0
+            self.msg = "Settings applied (%d disks from cache)." % len(paths)
+            self.schedule_info()
+        else:
+            self.start_rescan()      # nowe archiwum - brak cache, skanuj
+        return False
+
+    def draw_settings(self, cr, width, height, lh):
+        pad = 14
+        self.text(cr, pad, pad, "SETTINGS", WHITE)
+        cr.set_source_rgb(0.4, 0.4, 0.4)
+        cr.rectangle(pad, pad + lh + 2, width - 2 * pad, 1)
+        cr.fill()
+        label_w = int(width * 0.46)
+        y = pad + lh + 12
+        for i, (key, label, kind) in enumerate(self.CFG_ROWS):
+            if kind == "action":
+                value = ""
+            elif kind == "bool":
+                value = "YES" if self.cfg_work[key] else "NO"
+            elif kind == "cycle":
+                value = self.cfg_work[key] or "auto"
+            elif kind == "preset":
+                value = " ".join(self.cfg_work[key].split())
+            elif kind == "pass":
+                value = "*" * len(self.cfg_pass)
+            else:
+                value = str(self.cfg_work[key])
+            if self.cfg_edit == i:
+                value = (("*" * len(self.cfg_buf)) if kind == "pass" else self.cfg_buf) + "_"
+            sel = (i == self.cfg_cur)
+            if sel:
+                cr.set_source_rgb(*WHITE)
+                cr.rectangle(pad - 4, y, width - 2 * pad + 8, lh)
+                cr.fill()
+            col = BLACK if sel else WHITE
+            gap = 12 if kind != "action" else 0
+            if kind == "action":
+                self.text(cr, pad, y, "[ %s ]" % label, col, width - 2 * pad)
+            else:
+                self.text(cr, pad, y, label, col if sel else GRAY, label_w - pad)
+                self.text(cr, label_w + gap, y, value, col, width - label_w - gap - pad)
+            y += lh + (6 if kind == "action" and key_is_group_end(key) else 0)
+        if self.msg:
+            self.text(cr, pad, height - 4 * lh - 10, self.msg, WHITE, width - 2 * pad)
+        if self.cfg_edit is not None:
+            keys = [("Enter", "Accept"), ("Esc", "Cancel"), ("Ctrl+V", "Paste")]
+        else:
+            keys = [("\u2191\u2193", "Select"), ("Enter", "Edit/Change/Run"), ("Esc", "Close without saving")]
+        kh = lh + 2
+        bh = self.draw_keys(cr, 0, 0, width - 2 * pad, kh, keys, draw=False) + 8
+        cr.set_source_rgb(0.15, 0.15, 0.15)
+        cr.rectangle(0, height - bh - 6, width, bh + 6)
+        cr.fill()
+        self.draw_keys(cr, pad, height - bh - 2, width - 2 * pad, kh, keys)
+
+    # --- rysowanie
+    def layout(self, cr, width=None, wrap=False, mid=False):
+        lay = PangoCairo.create_layout(cr)
+        fd = Pango.FontDescription(FONT)
+        fd.set_absolute_size(FONT_PX * Pango.SCALE)
+        lay.set_font_description(fd)
+        if width is not None:
+            lay.set_width(int(width * Pango.SCALE))
+            if wrap:
+                lay.set_wrap(Pango.WrapMode.WORD_CHAR)
+            else:
+                lay.set_ellipsize(Pango.EllipsizeMode.MIDDLE if mid
+                                  else Pango.EllipsizeMode.END)
+        return lay
+
+    def draw_keys(self, cr, x, y, maxw, lh, keys, draw=True):
+        """Key bar: [key] caps (inverse video) + label. Wraps; returns height."""
+        lay = self.layout(cr)
+        cx, cy, gap = x, y, 14
+        for key, label in keys:
+            lay.set_text(key, -1)
+            kw = lay.get_pixel_size()[0] + 12
+            lay.set_text(label, -1)
+            lw = lay.get_pixel_size()[0]
+            if cx > x and cx + kw + 6 + lw > x + maxw:
+                cx, cy = x, cy + lh + 6
+            if draw:
+                cr.set_source_rgb(*WHITE)
+                cr.rectangle(cx, cy, kw, lh)
+                cr.fill()
+                cr.set_source_rgb(*BLACK)
+                cr.rectangle(cx + 1, cy + 1, kw - 2, lh - 2)
+                cr.set_line_width(1)
+                cr.stroke()
+                cr.set_source_rgb(*WHITE)
+                cr.rectangle(cx + 2, cy + 2, kw - 4, lh - 4)
+                cr.fill()
+                self.text(cr, cx + 6, cy + (lh - self.glyph_h) // 2, key, BLACK)
+                self.text(cr, cx + kw + 6, cy + (lh - self.glyph_h) // 2, label, WHITE)
+            cx += kw + 6 + lw + gap
+        return cy + lh - y
+
+    def item_text(self, idx, item):
+        kind, label, sub, _v = item
+        if kind == "dir":
+            return "[%s]  (%d)" % (label, count_disks(sub))
+        rel_i = self.fav_rels[idx] if self.fav_mode else self.rel_of(label)
+        return ("* " if rel_i in self.favs else "  ") + label
+
+    def names_width(self, cr, items):
+        """Szerokość (px) najdłuższej pozycji listy."""
+        if not items:
+            return 0
+        lay = self.layout(cr)
+        longest = max((self.item_text(i, it) for i, it in enumerate(items)), key=len)
+        lay.set_text(longest, -1)
+        return lay.get_pixel_size()[0]
+
+    def text(self, cr, x, y, s, color=WHITE, width=None, wrap=False, mid=False):
+        lay = self.layout(cr, width, wrap, mid)
+        lay.set_text(s, -1)
+        cr.set_source_rgb(*color)
+        cr.move_to(x, y)
+        PangoCairo.show_layout(cr, lay)
+        return lay.get_pixel_size()[1]
+
+    def draw(self, area, cr, width, height):
+        cr.set_source_rgb(*BLACK)
+        cr.paint()
+        pad = 10
+        lay = self.layout(cr)
+        lay.set_text("Ag", -1)
+        lh = lay.get_pixel_size()[1] + 4
+        self.line_h = lh
+        self.glyph_h = lay.get_pixel_size()[1]
+        if self.cfg_mode:
+            self.draw_settings(cr, width, height, lh)
+            return
+
+        # key bar at the bottom
+        keys = [("\u2191\u2193", "Move"), ("\u2192", "Open/Run"), ("\u2190", "Back"),
+                ("[ ]", "Page"), ("< >", "Top/End"), ("Space", "Wide list"),
+                ("- =", "Scroll text"), ("a", "Favorite"), ("Tab", "Favorites"),
+                ("t", "Machine/TOS"), ("c", "Settings"), ("f", "Fullscreen"),
+                ("R", "Rescan"), ("q", "Quit")]
+        kh = lh + 2
+        help_h = self.draw_keys(cr, 0, 0, width - 2 * pad, kh, keys, draw=False) + 8
+        cr.set_source_rgb(0.15, 0.15, 0.15)
+        cr.rectangle(0, height - help_h - pad, width, help_h + pad)
+        cr.fill()
+        self.draw_keys(cr, pad, height - help_h - pad + 4, width - 2 * pad, kh, keys)
+
+        # pasek komunikatu
+        status_y = height - help_h - pad - lh
+        if self.msg:
+            self.text(cr, pad, status_y, self.msg, WHITE, width - 2 * pad)
+
+        # lewa kolumna: menedżer plików
+        items = self.items()
+        need = self.names_width(cr, items) + 2 * pad + 16
+        if self.wide:
+            # lista zajmuje prawie całą szerokość, po prawej wąski pasek
+            left_w = min(need, width - 60)
+        else:
+            left_w = int(width * 0.42)      # jak dawniej: duża okładka i opis
+        path = "/" + "/".join(self.disp) if self.disp else "/"
+        if self.fav_mode:
+            path = "FAVORITES (%d)" % len(self.favs)
+        self.text(cr, pad, pad, "ATARI ST  " + path, WHITE, left_w - 2 * pad, mid=True)
+        list_top = pad + lh + 6
+        cr.set_source_rgb(0.4, 0.4, 0.4)
+        cr.rectangle(pad, list_top - 3, left_w - 2 * pad, 1)
+        cr.fill()
+        list_h = status_y - list_top - 4
+        self.rows = max(1, int(list_h // lh))
+        self.cur = max(0, min(self.cur, len(items) - 1)) if items else 0
+        if self.cur < self.top:
+            self.top = self.cur
+        if self.cur >= self.top + self.rows:
+            self.top = self.cur - self.rows + 1
+        for i in range(self.rows):
+            idx = self.top + i
+            if idx >= len(items):
+                break
+            y = list_top + i * lh
+            s = self.item_text(idx, items[idx])
+            if idx == self.cur:
+                cr.set_source_rgb(*WHITE)
+                cr.rectangle(pad, y, left_w - 2 * pad, lh)
+                cr.fill()
+                self.text(cr, pad + 4, y, s, BLACK, left_w - 2 * pad - 8, mid=True)
+            else:
+                self.text(cr, pad + 4, y, s, WHITE, left_w - 2 * pad - 8, mid=True)
+        if not items:
+            self.text(cr, pad, list_top, "(no favorites - press a on a disk)"
+                      if self.fav_mode else "(empty)", GRAY)
+        # pozycja
+        if items and not self.msg:
+            self.text(cr, pad, status_y, "%d / %d" % (self.cur + 1, len(items)), GRAY, left_w - 2 * pad)
+            cur_item = items[self.cur]
+            if cur_item[0] == "file":
+                # pełna nazwa zaznaczonej dyskietki (gdy lista ją skróciła)
+                full = self.fav_rels[self.cur] if self.fav_mode else cur_item[1]
+                self.text(cr, pad + 110, status_y, full, GRAY,
+                          (width if self.wide else left_w) - 2 * pad - 110, mid=True)
+
+        # separator
+        cr.set_source_rgb(0.4, 0.4, 0.4)
+        cr.rectangle(left_w, pad, 1, status_y - pad)
+        cr.fill()
+
+        # prawa kolumna: okładka (góra) i opis (dół)
+        if self.wide:
+            return
+        rx = left_w + pad
+        rw = width - rx - pad
+        avail_h = status_y - pad
+        cover_h = int(avail_h * 0.5)
+        sel = self.selection()
+        text, pb = self.cur_info
+        if sel and sel[0] == "dir":
+            n = count_disks(sel[2])
+            self.text(cr, rx, pad, "Folder: %s" % sel[1], WHITE, rw)
+            self.text(cr, rx, pad + lh, "Disks inside: %d" % n, GRAY, rw)
+        elif sel:
+            if pb is not None:
+                pw, ph = pb.get_width(), pb.get_height()
+                s = min(rw / pw, cover_h / ph, 3.0)
+                dx = rx + (rw - pw * s) / 2
+                cr.save()
+                cr.translate(dx, pad)
+                cr.scale(s, s)
+                Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+                cr.paint()
+                cr.restore()
+            else:
+                msg = "(loading...)" if self.info_loading else "(no cover)"
+                self.text(cr, rx, pad, msg, GRAY, rw)
+            ty = pad + cover_h + 8
+            cr.set_source_rgb(0.4, 0.4, 0.4)
+            cr.rectangle(rx, ty - 4, rw, 1)
+            cr.fill()
+            if text:
+                cr.save()
+                cr.rectangle(rx, ty, rw, status_y - ty)
+                cr.clip()
+                lay = self.layout(cr, rw, wrap=True)
+                lay.set_text(text, -1)
+                total = lay.get_pixel_size()[1]
+                self.max_scroll = max(0, total - (status_y - ty))
+                self.desc_scroll = max(0, min(self.desc_scroll, self.max_scroll))
+                cr.set_source_rgb(*WHITE)
+                cr.move_to(rx, ty - self.desc_scroll)
+                PangoCairo.show_layout(cr, lay)
+                cr.restore()
+                if self.max_scroll > 0 and not self.msg:
+                    pct = int(100 * self.desc_scroll / self.max_scroll)
+                    self.text(cr, rx, status_y, "description: - = / mouse wheel: scroll (%d%%)" % pct, GRAY, rw)
+            else:
+                msg = "(loading...)" if self.info_loading else "(no description)"
+                self.text(cr, rx, ty, msg, GRAY, rw)
+
+
+def main():
+    force = "--rescan" in sys.argv[1:] or "--rescal" in sys.argv[1:]
+    apply_config(load_config())
+    nas_ok, err = ensure_mounted()
+    if err:
+        print(err)
+    nas_ok = nas_ok and root_ready()
+    paths = []
+    if nas_ok and (force or not os.path.isfile(CACHE)):
+        print("Scanning %s (a few minutes on a slow link)..." % MOUNT)
+        paths = rescan(lambda n: print("\r%d disks..." % n, end="", flush=True))
+        print("\nCache saved: %d disks." % len(paths))
+    elif os.path.isfile(CACHE):
+        paths = load_cache()
+
+    browser = Browser(build_tree(paths, load_categories()), nas_ok)
+    browser.open_settings_on_start = not nas_ok and not paths
+    app = Gtk.Application(application_id="local.atari.menu")
+    app.connect("activate", browser.activate)
+    return app.run([])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
