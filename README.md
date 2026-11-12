@@ -65,6 +65,10 @@ Put your TOS images in `~/atarist/tos` and your disk archive in `~/atarist/ATARI
 
 `tools/` contains helper scripts used to build the category list (`categories.json`) from GameBase descriptions and TOSEC names: `prep-categories.py`, `merge-categories.py`, `merge-tosec.py`.
 
+## License
+
+GPL-3.0, see [LICENSE](LICENSE).
+
 ---
 
 # Polski
@@ -131,3 +135,7 @@ Obrazy TOS umieść w `~/atarist/tos`, a archiwum dyskietek w `~/atarist/ATARI_S
 ### Narzędzia
 
 Katalog `tools/` zawiera skrypty pomocnicze do budowy listy kategorii (`categories.json`) na podstawie opisów GameBase i nazw TOSEC: `prep-categories.py`, `merge-categories.py`, `merge-tosec.py`.
+
+## Licencja
+
+GPL-3.0, zobacz [LICENSE](LICENSE).

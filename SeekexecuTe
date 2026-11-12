@@ -8,6 +8,8 @@ Usage:
 Three panes: file manager (left), cover (top right), description (bottom right).
 Font: "Atari ST" by Patrick H. Lauke (FontStruct, CC BY) - see readme in ~/.local/share/fonts.
 Keys: see the key bar at the bottom of the screen.
+
+License: GPL-3.0 (see LICENSE).
 """
 import os
 import re
